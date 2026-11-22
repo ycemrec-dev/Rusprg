@@ -639,4 +639,133 @@ with tab_detail:
         if res:
             c1, c2, c3 = st.columns(3)
             c1.metric("Otomatik Ev xG (λ_h)", f"{res['lam_h']:.2f}")
-            c2.metric("Otomatik Dep xG (λ_a)", f"{res
+            c2.metric("Otomatik Dep xG (λ_a)", f"{res['lam_a']:.2f}")
+            c3.metric("Piyasa Marjı", f"%{res['margin']*100:.1f}")
+
+            st.subheader("Tüm Pazarlar: Olasılık, Adil Oran ve Otomatik Karar")
+            st.dataframe(pd.DataFrame(res["markets"]), use_container_width=True, hide_index=True)
+
+            st.subheader("Tüm Büroların Oran Karşılaştırması")
+            book_names = sorted(set(m["books"]["1"]) | set(m["books"]["X"]) | set(m["books"]["2"]))
+            bm_table = [{
+                "Büro": b,
+                "1": m["books"]["1"].get(b, "-"),
+                "X": m["books"]["X"].get(b, "-"),
+                "2": m["books"]["2"].get(b, "-"),
+                "2.5 Üst": m["books"]["O2.5"].get(b, "-"),
+                "2.5 Alt": m["books"]["U2.5"].get(b, "-"),
+            } for b in book_names]
+            st.dataframe(pd.DataFrame(bm_table), use_container_width=True, hide_index=True)
+
+# --- TAB 3: CANLI TARAYICI & OTOMATİK KAPANIŞ ORANI ---
+with tab_live:
+    col_f1, col_f2 = st.columns([3, 1])
+    hide_bad_min = col_f1.checkbox("Hatalı/Bitmiş dk (0' ve 86'+) gizle", value=True)
+    if col_f2.button("Canlıyı Yenile"):
+        fetch_sstats_live.clear()
+        fetch_sstats_closing_odds.clear()
+
+    use_pace = st.checkbox("Mevcut skor hızını (Bayesian Tempo) hesaba kat", value=True)
+
+    try:
+        raw_live = fetch_sstats_live(sstats_key)
+    except Exception as e:
+        raw_live = []
+        st.warning(f"SStats canlı verisi alınamadı: {e}")
+
+    live_matches = [m for m in raw_live if (1 <= m["minute"] <= 85)] if hide_bad_min else raw_live
+
+    if not live_matches:
+        st.info("Şu an filtreye uyan (1'–85' arası) aktif canlı maç bulunamadı.")
+    else:
+        scan_rows = []
+        live_cache = {}
+        for lm in live_matches:
+            fair_1x2, _ = devig_all([lm["o1"], lm["ox"], lm["o2"]])
+            p_o25 = devig_all([lm["oo"], lm["ou"]])[0][0] if (lm["oo"] and lm["ou"]) else None
+            lh, la = invert_odds_to_xg(fair_1x2[0], fair_1x2[2], p_o25)
+            lres = live_full_auto(lh, la, lm["minute"], lm["hg"], lm["ag"], use_pace=use_pace)
+            live_cache[lm["Etiket"]] = (lm, lh, la, lres)
+            scan_rows.append({
+                "Sinyal": lres["signal"],
+                "Maç": f"{lm['home']} - {lm['away']}",
+                "Lig": lm["league"],
+                "Skor": lm["score"],
+                "Dk": f"{lm['minute']}'",
+                "10 dk Gol (%)": lres["p10"],
+                "Ev +1 (%)": lres["p_home_g"],
+                "Dep +1 (%)": lres["p_away_g"],
+                "+1 Gol (%)": lres["p_more1"],
+                "+1 Adil Oran": lres["fair_more1"],
+            })
+
+        st.subheader("Otomatik Canlı Fırsat Tarayıcısı")
+        df_live_scan = pd.DataFrame(scan_rows).sort_values("10 dk Gol (%)", ascending=False)
+        st.dataframe(df_live_scan, use_container_width=True, hide_index=True)
+
+        # Seçili Canlı Maç İçin Kapanış Oranlarını OTOMATİK Çek
+        st.divider()
+        sel = st.selectbox("Detaylı Canlı Analiz İçin Maç Seçin (Kapanış Oranları Otomatik Çekilir)", [x["Etiket"] for x in live_matches])
+        lm, lh, la, lres = live_cache[sel]
+
+        auto_cl, cl_status = fetch_sstats_closing_odds(lm["id"], sstats_key)
+        def_1 = float(auto_cl.get("1", lm["o1"]))
+        def_x = float(auto_cl.get("X", lm["ox"]))
+        def_2 = float(auto_cl.get("2", lm["o2"]))
+        def_o25 = float(auto_cl.get("O2.5", lm["oo"] or 1.85))
+        def_u25 = float(auto_cl.get("U2.5", lm["ou"] or 1.95))
+
+        st.markdown("#### Maç Önü Kapanış Oranları (Otomatik Doldurulur • İsterseniz Düzenleyebilirsiniz)")
+        if cl_status == "OK":
+            st.success("✅ Kapanış oranları SStats üzerinden otomatik çekildi ve kutulara yazıldı.")
+        else:
+            st.info(f"ℹ️ Otomatik kapanış oranı çekilemedi ({cl_status}). Kutularda varsayılan değerler var; dilerseniz elle düzeltebilirsiniz.")
+
+        r1c1, r1c2, r1c3 = st.columns(3)
+        cl_1 = r1c1.number_input("Kapanış 1", min_value=1.02, max_value=50.0, value=def_1, step=0.05, key=f"c1_{lm['id']}_{def_1}")
+        cl_x = r1c2.number_input("Kapanış X", min_value=1.02, max_value=50.0, value=def_x, step=0.05, key=f"cx_{lm['id']}_{def_x}")
+        cl_2 = r1c3.number_input("Kapanış 2", min_value=1.02, max_value=50.0, value=def_2, step=0.05, key=f"c2_{lm['id']}_{def_2}")
+
+        r2c1, r2c2 = st.columns(2)
+        cl_o25 = r2c1.number_input("Kapanış 2.5 Üst", min_value=1.02, max_value=20.0, value=def_o25, step=0.05, key=f"co_{lm['id']}_{def_o25}")
+        cl_u25 = r2c2.number_input("Kapanış 2.5 Alt", min_value=1.02, max_value=20.0, value=def_u25, step=0.05, key=f"cu_{lm['id']}_{def_u25}")
+
+        # Kutudaki (otomatik veya düzenlenmiş) kapanış oranlarıyla anında hesapla
+        fair_1x2_cl, _ = devig_all([cl_1, cl_x, cl_2])
+        p_o25_cl = devig_all([cl_o25, cl_u25])[0][0]
+        lh, la = invert_odds_to_xg(fair_1x2_cl[0], fair_1x2_cl[2], p_o25_cl)
+        lres = live_full_auto(lh, la, lm["minute"], lm["hg"], lm["ag"], use_pace=use_pace)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Skor / Dakika", f"{lm['score']} ({lm['minute']}')")
+        k2.metric("Sinyal", lres["signal"])
+        k3.metric("Canlı Ev Tempo (xG)", f"{lres['lam_h_live']:.2f}", f"Ön: {lh:.2f}")
+        k4.metric("Canlı Dep Tempo (xG)", f"{lres['lam_a_live']:.2f}", f"Ön: {la:.2f}")
+
+        st.subheader("Tüm Canlı Pazarlar ve Otomatik Adil Oranlar")
+        st.dataframe(lres["markets_df"], use_container_width=True, hide_index=True)
+
+        col_a, col_b = st.columns(2)
+        col_a.markdown("**Kısa Vadede Gol Olasılığı ve Adil Oran**")
+        col_a.dataframe(lres["short_df"], use_container_width=True, hide_index=True)
+        col_b.markdown("**Sıradaki Gol (Toplam %100) ve Adil Oran**")
+        col_b.dataframe(lres["next_df"], use_container_width=True, hide_index=True)
+
+        # Otomatik Canlı Bahis Karar Hesaplayıcı (Adil Oran Kuralı)
+        st.divider()
+        st.subheader("Canlı Bahis Karar Hesaplayıcı (Büro Oranını Test Et)")
+        bc1, bc2 = st.columns([2, 1])
+        chosen_mkt = bc1.selectbox("Oynamak İstediğiniz Canlı Pazar", list(lres["market_probs"].keys()))
+        book_odd = bc2.number_input("Sitenizdeki Canlı Oran", min_value=1.01, max_value=50.0, value=1.85, step=0.05)
+
+        prob_m = lres["market_probs"][chosen_mkt]
+        fair_m = safe_fair_odd(prob_m)
+        edge_m = prob_m * book_odd - 1.0
+        kelly_m = round(0.25 * (edge_m / (book_odd - 1.0)) * bankroll, 1) if (edge_m > 0 and book_odd > 1.0) else 0.0
+
+        if edge_m >= 0.05 and book_odd >= 1.40:
+            st.success(f"✅ GÜÇLÜ DEĞER (ALINIR) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: +%{edge_m*100:.1f} | 1/4 Kelly: {kelly_m} birim")
+        elif edge_m >= 0.02 and book_odd >= 1.40:
+            st.info(f"🟡 DEĞERLİ (ALINABİLİR) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: +%{edge_m*100:.1f} | 1/4 Kelly: {kelly_m} birim")
+        else:
+            st.error(f"❌ PAS GEÇ (ORAN DÜŞÜK) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: %{edge_m*100:.1f}")
