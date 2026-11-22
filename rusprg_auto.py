@@ -8,7 +8,7 @@ import streamlit as st
 from scipy.optimize import brentq
 from scipy.stats import poisson, nbinom
 
-st.set_page_config(page_title="RUSPRG Auto v4.3 Pro", layout="wide")
+st.set_page_config(page_title="RUSPRG Auto v4.4 Pro", layout="wide")
 
 TR_TZ = timezone(timedelta(hours=3))
 
@@ -27,7 +27,7 @@ LEAGUES = {
 
 
 # ==============================================================================
-# 1. İSTATİSTİKSEL MOTOR (P, Q, R, U, W, X, V ve CANLI v4.3)
+# 1. İSTATİSTİKSEL MOTOR (P, Q, R, U, W, X, V ve CANLI v4.4)
 # ==============================================================================
 def safe_fair_odd(prob):
     if prob is None or prob <= 0.001:
@@ -255,22 +255,36 @@ def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=
     }
 
 
-def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals):
+def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
     """
-    Canlı maç için tüm olasılıkları ve Adil Oranları (1 / Olasılık) otomatik üretir.
+    Canlı maç için mevcut skor hızını (Bayesian güncelleme) hesaba katarak
+    tüm olasılıkları, Adil Oranları ve takım bazlı sinyalleri otomatik üretir.
     """
-    rem = max(0.0, 90.0 - float(minute))
-    frac = rem / 90.0
-    lh, la = lam_h * frac, lam_a * frac
+    m_clamped = max(0.0, min(90.0, float(minute)))
+    elapsed_frac = m_clamped / 90.0
+    rem = max(0.0, 90.0 - m_clamped)
+    rem_frac = rem / 90.0
+    hg = int(home_goals)
+    ag = int(away_goals)
+    cur_total = hg + ag
+
+    # Bayesian (Gamma-Poisson) Tempo Güncellemesi (Prior ağırlığı k=1.5 maç)
+    if use_pace and elapsed_frac > 0:
+        k_prior = 1.5
+        lam_h_live = float(np.clip((k_prior * lam_h + hg) / (k_prior + elapsed_frac), 0.25, 4.0))
+        lam_a_live = float(np.clip((k_prior * lam_a + ag) / (k_prior + elapsed_frac), 0.25, 4.0))
+    else:
+        lam_h_live, lam_a_live = lam_h, lam_a
+
+    lh, la = lam_h_live * rem_frac, lam_a_live * rem_frac
     tot_rem = lh + la
-    cur_total = int(home_goals) + int(away_goals)
 
     # 5 / 10 / 15 dk gol olasılığı + Adil Oran
     short_rows = []
     p10_val = 0.0
     for w in (5, 10, 15):
         w_eff = min(w, rem)
-        p_w = 1.0 - math.exp(-(lam_h + lam_a) * (w_eff / 90.0)) if w_eff > 0 else 0.0
+        p_w = 1.0 - math.exp(-(lam_h_live + lam_a_live) * (w_eff / 90.0)) if w_eff > 0 else 0.0
         if w == 10:
             p10_val = p_w
         short_rows.append({
@@ -320,21 +334,31 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals):
         for name, prob in market_dict.items()
     ]
 
-    # Trafik Işığı Sinyali (Frankenstein v4.1 eşikleri)
+    # Takım Bazlı Trafik Işığı Sinyali
+    ph_pct = int(round(p_home_scores * 100))
+    pa_pct = int(round(p_away_scores * 100))
     if p10_val >= 0.45:
         signal = "🟢 GOL YAKIN"
     elif p10_val >= 0.35:
         signal = "🟡 TEMPO YÜKSEK"
-    elif p_home_scores >= 0.55 or p_away_scores >= 0.55:
-        signal = "🟡 TAKIM GOLÜ OLABİLİR"
+    elif p_home_scores >= 0.55 and p_away_scores >= 0.55:
+        signal = f"🟡 İKİ TAKIM (E:%{ph_pct} D:%{pa_pct})"
+    elif p_home_scores >= 0.55:
+        signal = f"🟡 EV GOLÜ (%{ph_pct})"
+    elif p_away_scores >= 0.55:
+        signal = f"🟡 DEP GOLÜ (%{pa_pct})"
     else:
         signal = "⚪ NORMAL"
 
     return {
         "rem_min": int(rem),
+        "lam_h_live": lam_h_live,
+        "lam_a_live": lam_a_live,
         "p10": round(p10_val * 100, 1),
         "p_more1": round(p_at_least_1 * 100, 1),
         "fair_more1": safe_fair_odd(p_at_least_1),
+        "p_home_g": round(p_home_scores * 100, 1),
+        "p_away_g": round(p_away_scores * 100, 1),
         "signal": signal,
         "short_df": pd.DataFrame(short_rows),
         "next_df": pd.DataFrame(next_rows),
@@ -442,12 +466,23 @@ def fetch_sstats_live():
                     if nm == "over 2.5": oo = float(val)
                     elif nm == "under 2.5": ou = float(val)
 
+        has_1x2 = (o1 is not None and ox is not None and o2 is not None)
+        has_ou = (oo is not None and ou is not None)
+        if has_1x2 and has_ou:
+            odds_status = "Oran: TAM ✅"
+        elif has_1x2:
+            odds_status = "Oran: 1X2 ✅"
+        else:
+            odds_status = "Varsayılan ⚠️"
+
         parsed.append({
-            "Etiket": f"[{league}] {home} - {away} ({hg}-{ag} | {minute}')",
+            "Etiket": f"[{league}] {home} - {away} ({hg}-{ag} | {minute}') [{odds_status}]",
             "league": league, "home": home, "away": away,
             "hg": hg, "ag": ag, "score": f"{hg}-{ag}", "minute": minute,
             "o1": o1 or 2.15, "ox": ox or 3.30, "o2": o2 or 3.40,
-            "oo": oo, "ou": ou, "has_odds": o1 is not None,
+            "oo": oo, "ou": ou,
+            "has_real_odds": has_1x2,
+            "odds_status": odds_status,
         })
     return parsed
 
@@ -455,8 +490,8 @@ def fetch_sstats_live():
 # ==============================================================================
 # 3. ARAYÜZ
 # ==============================================================================
-st.title("RUSPRG Auto v4.3 Pro")
-st.caption("Tam Otomatik Maç Önü Value Tarayıcı • Canlı Sinyal Tarayıcı • Adil Oran & Karar Motoru")
+st.title("RUSPRG Auto v4.4 Pro")
+st.caption("Tam Otomatik Maç Önü Value Tarayıcı • Canlı Tempo & Sinyal Tarayıcı • Adil Oran Karar Motoru")
 
 today_tr = datetime.now(TR_TZ).date()
 
@@ -559,10 +594,13 @@ with tab_detail:
 
 # --- TAB 3: CANLI TARAYICI & ADİL ORAN HESAPLAYICI ---
 with tab_live:
-    col_f1, col_f2 = st.columns([3, 1])
-    hide_bad_min = col_f1.checkbox("Hatalı/Bitmiş dakikaları (0' ve 86'+) otomatik gizle", value=True)
-    if col_f2.button("Canlıyı Yenile"):
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
+    hide_bad_min = col_f1.checkbox("Hatalı/Bitmiş dk (0' ve 86'+) gizle", value=True)
+    only_real_odds = col_f2.checkbox("Sadece gerçek oranı gelen maçlar ✅", value=False)
+    if col_f3.button("Canlıyı Yenile"):
         fetch_sstats_live.clear()
+
+    use_pace = st.checkbox("Mevcut skor hızını (Bayesian Tempo) hesaba kat", value=True)
 
     try:
         raw_live = fetch_sstats_live()
@@ -570,45 +608,54 @@ with tab_live:
         raw_live = []
         st.warning(f"SStats canlı verisi alınamadı: {e}")
 
-    live_matches = [m for m in raw_live if (1 <= m["minute"] <= 85)] if hide_bad_min else raw_live
+    live_matches = raw_live
+    if hide_bad_min:
+        live_matches = [m for m in live_matches if (1 <= m["minute"] <= 85)]
+    if only_real_odds:
+        live_matches = [m for m in live_matches if m["has_real_odds"]]
 
     if not live_matches:
-        st.info("Filtreye uyan (1'–85' arası) aktif canlı maç şu an bulunamadı.")
+        st.info("Seçili filtrelere uyan aktif canlı maç şu an bulunamadı. 'Sadece gerçek oranı gelen maçlar' filtresini kaldırarak tüm maçları görebilirsiniz.")
     else:
-        # 1) Tüm Canlı Maçları Otomatik Tara ve Sinyale Göre Sırala
         scan_rows = []
         live_cache = {}
         for lm in live_matches:
             fair_1x2, _ = devig_all([lm["o1"], lm["ox"], lm["o2"]])
             p_o25 = devig_all([lm["oo"], lm["ou"]])[0][0] if (lm["oo"] and lm["ou"]) else None
             lh, la = invert_odds_to_xg(fair_1x2[0], fair_1x2[2], p_o25)
-            lres = live_full_auto(lh, la, lm["minute"], lm["hg"], lm["ag"])
+            lres = live_full_auto(lh, la, lm["minute"], lm["hg"], lm["ag"], use_pace=use_pace)
             live_cache[lm["Etiket"]] = (lm, lh, la, lres)
             scan_rows.append({
                 "Sinyal": lres["signal"],
+                "Veri": lm["odds_status"],
                 "Maç": f"{lm['home']} - {lm['away']}",
                 "Lig": lm["league"],
                 "Skor": lm["score"],
                 "Dk": f"{lm['minute']}'",
                 "10 dk Gol (%)": lres["p10"],
+                "Ev +1 (%)": lres["p_home_g"],
+                "Dep +1 (%)": lres["p_away_g"],
                 "+1 Gol (%)": lres["p_more1"],
-                "+1 Gol Adil Oran": lres["fair_more1"],
+                "+1 Adil Oran": lres["fair_more1"],
             })
 
         st.subheader("Otomatik Canlı Fırsat Tarayıcısı")
         df_live_scan = pd.DataFrame(scan_rows).sort_values("10 dk Gol (%)", ascending=False)
         st.dataframe(df_live_scan, use_container_width=True, hide_index=True)
 
-        # 2) Seçili Canlı Maçın Detaylı Adil Oran Tabloları
+        # Seçili Canlı Maçın Detaylı Adil Oran Tabloları
         st.divider()
         sel = st.selectbox("Detaylı Canlı Analiz ve Büro Oranı Testi İçin Maç Seçin", [x["Etiket"] for x in live_matches])
         lm, lh, la, lres = live_cache[sel]
 
+        if not lm["has_real_odds"]:
+            st.warning("⚠️ Bu maçın SStats ön oranı boş geldiği için varsayılan 2.65 xG üzerinden mevcut skor hızı (Bayesian) ile hesaplanmıştır.")
+
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Skor / Dakika", f"{lm['score']} ({lm['minute']}')")
         k2.metric("Sinyal", lres["signal"])
-        k3.metric("Maç Öncesi Ev xG", f"{lh:.2f}")
-        k4.metric("Maç Öncesi Dep xG", f"{la:.2f}")
+        k3.metric("Canlı Ev Tempo (xG)", f"{lres['lam_h_live']:.2f}", f"Ön: {lh:.2f}")
+        k4.metric("Canlı Dep Tempo (xG)", f"{lres['lam_a_live']:.2f}", f"Ön: {la:.2f}")
 
         st.subheader("Tüm Canlı Pazarlar ve Otomatik Adil Oranlar")
         st.dataframe(lres["markets_df"], use_container_width=True, hide_index=True)
@@ -619,7 +666,7 @@ with tab_live:
         col_b.markdown("**Sıradaki Gol (Toplam %100) ve Adil Oran**")
         col_b.dataframe(lres["next_df"], use_container_width=True, hide_index=True)
 
-        # 3) Otomatik Canlı Bahis Karar Hesaplayıcı (Adil Oran Kuralı)
+        # Otomatik Canlı Bahis Karar Hesaplayıcı (Adil Oran Kuralı)
         st.divider()
         st.subheader("Canlı Bahis Karar Hesaplayıcı (Büro Oranını Test Et)")
         bc1, bc2 = st.columns([2, 1])
