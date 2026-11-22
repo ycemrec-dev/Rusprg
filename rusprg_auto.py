@@ -443,5 +443,7 @@ with tab_live:
 
         g_in, nxt = live_v42(lh, la, lm["minute"])
         col_a, col_b = st.columns(2)
-        col_a.write("**Kısa Vadede Gol Olasılığı (%):**", g_in)
-        col_b.write("**Sıradaki Gol Dağılımı (% — Toplam 100):**", nxt)
+        col_a.markdown("**Kısa Vadede Gol Olasılığı (%)**")
+     col_a.table(pd.DataFrame(g_in.items(), columns=["Süre", "Olasılık (%)"]))
+     col_b.markdown("**Sıradaki Gol Dağılımı (% — Toplam 100)**")
+     col_b.table(pd.DataFrame(nxt.items(), columns=["İhtimal", "Olasılık (%)"]))
