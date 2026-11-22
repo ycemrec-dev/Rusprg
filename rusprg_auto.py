@@ -8,7 +8,7 @@ import streamlit as st
 from scipy.optimize import brentq
 from scipy.stats import poisson, nbinom
 
-st.set_page_config(page_title="RUSPRG Auto v4.4 Pro", layout="wide")
+st.set_page_config(page_title="RUSPRG Auto v4.6 Pro", layout="wide")
 
 TR_TZ = timezone(timedelta(hours=3))
 
@@ -27,7 +27,7 @@ LEAGUES = {
 
 
 # ==============================================================================
-# 1. İSTATİSTİKSEL MOTOR (P, Q, R, U, W, X, V ve CANLI v4.4)
+# 1. İSTATİSTİKSEL MOTOR (P, Q, R, U, W, X, V ve CANLI v4.6)
 # ==============================================================================
 def safe_fair_odd(prob):
     if prob is None or prob <= 0.001:
@@ -256,10 +256,6 @@ def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=
 
 
 def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
-    """
-    Canlı maç için mevcut skor hızını (Bayesian güncelleme) hesaba katarak
-    tüm olasılıkları, Adil Oranları ve takım bazlı sinyalleri otomatik üretir.
-    """
     m_clamped = max(0.0, min(90.0, float(minute)))
     elapsed_frac = m_clamped / 90.0
     rem = max(0.0, 90.0 - m_clamped)
@@ -268,7 +264,6 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
     ag = int(away_goals)
     cur_total = hg + ag
 
-    # Bayesian (Gamma-Poisson) Tempo Güncellemesi (Prior ağırlığı k=1.5 maç)
     if use_pace and elapsed_frac > 0:
         k_prior = 1.5
         lam_h_live = float(np.clip((k_prior * lam_h + hg) / (k_prior + elapsed_frac), 0.25, 4.0))
@@ -279,7 +274,6 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
     lh, la = lam_h_live * rem_frac, lam_a_live * rem_frac
     tot_rem = lh + la
 
-    # 5 / 10 / 15 dk gol olasılığı + Adil Oran
     short_rows = []
     p10_val = 0.0
     for w in (5, 10, 15):
@@ -293,7 +287,6 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
             "Adil Oran": safe_fair_odd(p_w),
         })
 
-    # Sıradaki Gol (3 ihtimal toplam tam %100) + Adil Oran
     p_no_more = math.exp(-tot_rem)
     p_at_least_1 = 1.0 - p_no_more
     p_at_least_2 = 1.0 - math.exp(-tot_rem) * (1.0 + tot_rem)
@@ -312,7 +305,6 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
         {"İhtimal": "Daha Fazla Gol Olmaz", "Olasılık (%)": round(p_no_more * 100, 1), "Adil Oran": safe_fair_odd(p_no_more)},
     ]
 
-    # Dinamik Canlı Pazarlar (Mevcut Skora Göre)
     line_1 = cur_total + 0.5
     line_2 = cur_total + 1.5
     market_dict = {
@@ -334,7 +326,6 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
         for name, prob in market_dict.items()
     ]
 
-    # Takım Bazlı Trafik Işığı Sinyali
     ph_pct = int(round(p_home_scores * 100))
     pa_pct = int(round(p_away_scores * 100))
     if p10_val >= 0.45:
@@ -368,7 +359,7 @@ def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals, use_pace=True):
 
 
 # ==============================================================================
-# 2. VERİ ÇEKİCİLER (The Odds API v4 + SStats Canlı)
+# 2. VERİ ÇEKİCİLER (The Odds API v4 + SStats Canlı & Otomatik Kapanış Oranı)
 # ==============================================================================
 @st.cache_data(ttl=120)
 def fetch_odds_api(api_key, sport_key):
@@ -434,15 +425,101 @@ def fetch_odds_api(api_key, sport_key):
     return parsed, remaining
 
 
+def _parse_sstats_odds_blocks(blocks):
+    """SStats /Odds/{gameId} veya /Games/{gameId} JSON yapısından 1X2 ve 2.5 Alt/Üst çıkarır."""
+    vals = {"1": [], "X": [], "2": [], "O2.5": [], "U2.5": []}
+
+    def scan_markets(mk_list):
+        if not isinstance(mk_list, list):
+            return
+        for mk in mk_list:
+            if not isinstance(mk, dict):
+                continue
+            if "odds" in mk and isinstance(mk["odds"], list) and mk["odds"] and isinstance(mk["odds"][0], dict):
+                if "marketName" in mk["odds"][0] or "odds" in mk["odds"][0]:
+                    scan_markets(mk["odds"])
+                    continue
+            if "markets" in mk and isinstance(mk["markets"], list):
+                scan_markets(mk["markets"])
+                continue
+
+            m_name = str(mk.get("marketName") or mk.get("name") or "").lower()
+            selections = mk.get("odds") or mk.get("values") or []
+            if not isinstance(selections, list):
+                continue
+            for sel in selections:
+                if not isinstance(sel, dict):
+                    continue
+                nm = str(sel.get("name") or sel.get("valueName") or "").lower().strip()
+                raw_v = sel.get("value") or sel.get("odd") or sel.get("closing")
+                try:
+                    v = float(raw_v)
+                except (TypeError, ValueError):
+                    continue
+                if v <= 1.01:
+                    continue
+
+                if "match winner" in m_name or "1x2" in m_name or "full time" in m_name:
+                    if nm in ("home", "1"): vals["1"].append(v)
+                    elif nm in ("draw", "x"): vals["X"].append(v)
+                    elif nm in ("away", "2"): vals["2"].append(v)
+                elif "goals over/under" in m_name or "over/under" in m_name or "total" in m_name:
+                    if nm in ("over 2.5", "o 2.5", "over2.5"): vals["O2.5"].append(v)
+                    elif nm in ("under 2.5", "u 2.5", "under2.5"): vals["U2.5"].append(v)
+
+    if isinstance(blocks, dict):
+        for k in ("data", "odds", "bookmakers", "markets"):
+            if k in blocks:
+                scan_markets(blocks[k] if isinstance(blocks[k], list) else [blocks[k]])
+    elif isinstance(blocks, list):
+        scan_markets(blocks)
+
+    out = {}
+    for k, lst in vals.items():
+        if lst:
+            out[k] = round(float(np.median(lst)), 2)
+    return out
+
+
+@st.cache_data(ttl=300)
+def fetch_sstats_closing_odds(game_id, sstats_key=""):
+    """Seçili canlı maçın maç önü kapanış oranlarını SStats /Odds/{gameId} üzerinden otomatik çeker."""
+    if not game_id:
+        return {}, "Maç ID bulunamadı"
+
+    params = {"apikey": sstats_key} if sstats_key else {}
+    endpoints = [
+        f"https://api.sstats.net/Odds/{game_id}",
+        f"https://api.sstats.net/Games/{game_id}",
+    ]
+    last_err = ""
+    for url in endpoints:
+        try:
+            r = requests.get(url, params=params, timeout=8)
+            if r.status_code == 200:
+                parsed = _parse_sstats_odds_blocks(r.json())
+                if "1" in parsed and "X" in parsed and "2" in parsed:
+                    return parsed, "OK"
+            elif r.status_code in (401, 403):
+                last_err = "SStats bu maçın kapanış oranı için ücretsiz API anahtarı istiyor."
+            else:
+                last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+    return {}, last_err or "Bu maç için kapanış oranı kaydı bulunamadı."
+
+
 @st.cache_data(ttl=45)
-def fetch_sstats_live():
+def fetch_sstats_live(sstats_key=""):
     url = "https://api.sstats.net/Games/list?Live=true"
-    resp = requests.get(url, timeout=10)
+    params = {"apikey": sstats_key} if sstats_key else {}
+    resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     raw = resp.json()
     games = raw.get("data", raw) if isinstance(raw, dict) else raw
     parsed = []
     for g in games:
+        gid = g.get("id") or g.get("gameId") or g.get("fixtureId")
         home = (g.get("homeTeam") or {}).get("name") or g.get("homeName") or "Ev Sahibi"
         away = (g.get("awayTeam") or {}).get("name") or g.get("awayName") or "Deplasman"
         league = ((g.get("season") or {}).get("league") or {}).get("name") or g.get("leagueName") or "Lig"
@@ -450,39 +527,21 @@ def fetch_sstats_live():
         ag = int(g.get("awayResult") or 0)
         minute = int(g.get("elapsed") or g.get("minute") or 0)
 
-        o1 = ox = o2 = oo = ou = None
-        for mk in (g.get("odds") or []):
-            m_name = str(mk.get("marketName", "")).lower()
-            for sel in mk.get("odds", []):
-                nm = str(sel.get("name", "")).lower()
-                val = sel.get("value")
-                if not val:
-                    continue
-                if "match winner" in m_name or "1x2" in m_name:
-                    if nm in ("home", "1"): o1 = float(val)
-                    elif nm in ("draw", "x"): ox = float(val)
-                    elif nm in ("away", "2"): o2 = float(val)
-                elif "goals over/under" in m_name:
-                    if nm == "over 2.5": oo = float(val)
-                    elif nm == "under 2.5": ou = float(val)
-
-        has_1x2 = (o1 is not None and ox is not None and o2 is not None)
-        has_ou = (oo is not None and ou is not None)
-        if has_1x2 and has_ou:
-            odds_status = "Oran: TAM ✅"
-        elif has_1x2:
-            odds_status = "Oran: 1X2 ✅"
-        else:
-            odds_status = "Varsayılan ⚠️"
+        inline_odds = _parse_sstats_odds_blocks(g.get("odds") or [])
+        o1 = inline_odds.get("1")
+        ox = inline_odds.get("X")
+        o2 = inline_odds.get("2")
+        oo = inline_odds.get("O2.5")
+        ou = inline_odds.get("U2.5")
 
         parsed.append({
-            "Etiket": f"[{league}] {home} - {away} ({hg}-{ag} | {minute}') [{odds_status}]",
+            "id": gid,
+            "Etiket": f"[{league}] {home} - {away} ({hg}-{ag} | {minute}')",
             "league": league, "home": home, "away": away,
             "hg": hg, "ag": ag, "score": f"{hg}-{ag}", "minute": minute,
             "o1": o1 or 2.15, "ox": ox or 3.30, "o2": o2 or 3.40,
             "oo": oo, "ou": ou,
-            "has_real_odds": has_1x2,
-            "odds_status": odds_status,
+            "has_real_odds": (o1 is not None and ox is not None and o2 is not None),
         })
     return parsed
 
@@ -490,8 +549,8 @@ def fetch_sstats_live():
 # ==============================================================================
 # 3. ARAYÜZ
 # ==============================================================================
-st.title("RUSPRG Auto v4.4 Pro")
-st.caption("Tam Otomatik Maç Önü Value Tarayıcı • Canlı Tempo & Sinyal Tarayıcı • Adil Oran Karar Motoru")
+st.title("RUSPRG Auto v4.6 Pro")
+st.caption("Tam Otomatik Maç Önü Value Tarayıcı • Canlı Tempo & Otomatik Kapanış Oranı Motoru")
 
 today_tr = datetime.now(TR_TZ).date()
 
@@ -502,6 +561,12 @@ with st.sidebar:
         value=os.getenv("ODDS_API_KEY", ""),
         type="password",
         help="the-odds-api.com ücretsiz API anahtarı",
+    )
+    sstats_key = st.text_input(
+        "SStats API Anahtarı (İsteğe Bağlı)",
+        value=os.getenv("SSTATS_API_KEY", ""),
+        type="password",
+        help="Boş bırakılabilir; SStats kapanış oranları için gerekirse sstats.net'ten ücretsiz alınabilir.",
     )
     selected_league = st.selectbox("Lig Seçin", list(LEAGUES.keys()))
     date_filter = st.selectbox("Tarih Filtresi", ["Sadece Bugün", "Bugün + Yarın", "Tüm Yaklaşanlar"], index=0)
@@ -560,7 +625,7 @@ with tab_scan:
             df_val = pd.DataFrame(all_values).sort_values("Edge (%)", ascending=False)
             st.success(f"{len(matches_api)} maç tarandı • {len(df_val)} değer bahsi (Value) bulundu.")
             st.dataframe(df_val, use_container_width=True, hide_index=True)
-            st.caption("🟢 GÜÇLÜ DEĞER: Edge ≥ %5 | 🟡 DEĞERLİ: Edge %2–%5 | ⚠️ KONTROL (!): Büro oranı medyanın %8+ üstünde (sakatlık/bayat hat kontrolü yapın).")
+            st.caption("🟢 GÜÇLÜ DEĞER: Edge ≥ %5 | 🟡 DEĞERLİ: Edge %2–%5 | ⚠️ KONTROL (!): Büro oranı medyanın %8+ üstünde.")
 
 with tab_detail:
     if not matches_api:
@@ -574,113 +639,4 @@ with tab_detail:
         if res:
             c1, c2, c3 = st.columns(3)
             c1.metric("Otomatik Ev xG (λ_h)", f"{res['lam_h']:.2f}")
-            c2.metric("Otomatik Dep xG (λ_a)", f"{res['lam_a']:.2f}")
-            c3.metric("Piyasa Marjı", f"%{res['margin']*100:.1f}")
-
-            st.subheader("Tüm Pazarlar: Olasılık, Adil Oran ve Otomatik Karar")
-            st.dataframe(pd.DataFrame(res["markets"]), use_container_width=True, hide_index=True)
-
-            st.subheader("Tüm Büroların Oran Karşılaştırması")
-            book_names = sorted(set(m["books"]["1"]) | set(m["books"]["X"]) | set(m["books"]["2"]))
-            bm_table = [{
-                "Büro": b,
-                "1": m["books"]["1"].get(b, "-"),
-                "X": m["books"]["X"].get(b, "-"),
-                "2": m["books"]["2"].get(b, "-"),
-                "2.5 Üst": m["books"]["O2.5"].get(b, "-"),
-                "2.5 Alt": m["books"]["U2.5"].get(b, "-"),
-            } for b in book_names]
-            st.dataframe(pd.DataFrame(bm_table), use_container_width=True, hide_index=True)
-
-# --- TAB 3: CANLI TARAYICI & ADİL ORAN HESAPLAYICI ---
-with tab_live:
-    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
-    hide_bad_min = col_f1.checkbox("Hatalı/Bitmiş dk (0' ve 86'+) gizle", value=True)
-    only_real_odds = col_f2.checkbox("Sadece gerçek oranı gelen maçlar ✅", value=False)
-    if col_f3.button("Canlıyı Yenile"):
-        fetch_sstats_live.clear()
-
-    use_pace = st.checkbox("Mevcut skor hızını (Bayesian Tempo) hesaba kat", value=True)
-
-    try:
-        raw_live = fetch_sstats_live()
-    except Exception as e:
-        raw_live = []
-        st.warning(f"SStats canlı verisi alınamadı: {e}")
-
-    live_matches = raw_live
-    if hide_bad_min:
-        live_matches = [m for m in live_matches if (1 <= m["minute"] <= 85)]
-    if only_real_odds:
-        live_matches = [m for m in live_matches if m["has_real_odds"]]
-
-    if not live_matches:
-        st.info("Seçili filtrelere uyan aktif canlı maç şu an bulunamadı. 'Sadece gerçek oranı gelen maçlar' filtresini kaldırarak tüm maçları görebilirsiniz.")
-    else:
-        scan_rows = []
-        live_cache = {}
-        for lm in live_matches:
-            fair_1x2, _ = devig_all([lm["o1"], lm["ox"], lm["o2"]])
-            p_o25 = devig_all([lm["oo"], lm["ou"]])[0][0] if (lm["oo"] and lm["ou"]) else None
-            lh, la = invert_odds_to_xg(fair_1x2[0], fair_1x2[2], p_o25)
-            lres = live_full_auto(lh, la, lm["minute"], lm["hg"], lm["ag"], use_pace=use_pace)
-            live_cache[lm["Etiket"]] = (lm, lh, la, lres)
-            scan_rows.append({
-                "Sinyal": lres["signal"],
-                "Veri": lm["odds_status"],
-                "Maç": f"{lm['home']} - {lm['away']}",
-                "Lig": lm["league"],
-                "Skor": lm["score"],
-                "Dk": f"{lm['minute']}'",
-                "10 dk Gol (%)": lres["p10"],
-                "Ev +1 (%)": lres["p_home_g"],
-                "Dep +1 (%)": lres["p_away_g"],
-                "+1 Gol (%)": lres["p_more1"],
-                "+1 Adil Oran": lres["fair_more1"],
-            })
-
-        st.subheader("Otomatik Canlı Fırsat Tarayıcısı")
-        df_live_scan = pd.DataFrame(scan_rows).sort_values("10 dk Gol (%)", ascending=False)
-        st.dataframe(df_live_scan, use_container_width=True, hide_index=True)
-
-        # Seçili Canlı Maçın Detaylı Adil Oran Tabloları
-        st.divider()
-        sel = st.selectbox("Detaylı Canlı Analiz ve Büro Oranı Testi İçin Maç Seçin", [x["Etiket"] for x in live_matches])
-        lm, lh, la, lres = live_cache[sel]
-
-        if not lm["has_real_odds"]:
-            st.warning("⚠️ Bu maçın SStats ön oranı boş geldiği için varsayılan 2.65 xG üzerinden mevcut skor hızı (Bayesian) ile hesaplanmıştır.")
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Skor / Dakika", f"{lm['score']} ({lm['minute']}')")
-        k2.metric("Sinyal", lres["signal"])
-        k3.metric("Canlı Ev Tempo (xG)", f"{lres['lam_h_live']:.2f}", f"Ön: {lh:.2f}")
-        k4.metric("Canlı Dep Tempo (xG)", f"{lres['lam_a_live']:.2f}", f"Ön: {la:.2f}")
-
-        st.subheader("Tüm Canlı Pazarlar ve Otomatik Adil Oranlar")
-        st.dataframe(lres["markets_df"], use_container_width=True, hide_index=True)
-
-        col_a, col_b = st.columns(2)
-        col_a.markdown("**Kısa Vadede Gol Olasılığı ve Adil Oran**")
-        col_a.dataframe(lres["short_df"], use_container_width=True, hide_index=True)
-        col_b.markdown("**Sıradaki Gol (Toplam %100) ve Adil Oran**")
-        col_b.dataframe(lres["next_df"], use_container_width=True, hide_index=True)
-
-        # Otomatik Canlı Bahis Karar Hesaplayıcı (Adil Oran Kuralı)
-        st.divider()
-        st.subheader("Canlı Bahis Karar Hesaplayıcı (Büro Oranını Test Et)")
-        bc1, bc2 = st.columns([2, 1])
-        chosen_mkt = bc1.selectbox("Oynamak İstediğiniz Canlı Pazar", list(lres["market_probs"].keys()))
-        book_odd = bc2.number_input("Sitenizdeki Canlı Oran", min_value=1.01, max_value=50.0, value=1.85, step=0.05)
-
-        prob_m = lres["market_probs"][chosen_mkt]
-        fair_m = safe_fair_odd(prob_m)
-        edge_m = prob_m * book_odd - 1.0
-        kelly_m = round(0.25 * (edge_m / (book_odd - 1.0)) * bankroll, 1) if (edge_m > 0 and book_odd > 1.0) else 0.0
-
-        if edge_m >= 0.05 and book_odd >= 1.40:
-            st.success(f"✅ GÜÇLÜ DEĞER (ALINIR) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: +%{edge_m*100:.1f} | 1/4 Kelly: {kelly_m} birim")
-        elif edge_m >= 0.02 and book_odd >= 1.40:
-            st.info(f"🟡 DEĞERLİ (ALINABİLİR) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: +%{edge_m*100:.1f} | 1/4 Kelly: {kelly_m} birim")
-        else:
-            st.error(f"❌ PAS GEÇ (ORAN DÜŞÜK) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: %{edge_m*100:.1f}")
+            c2.metric("Otomatik Dep xG (λ_a)", f"{res
