@@ -1,5 +1,6 @@
 import math
 import os
+from datetime import datetime, timezone, timedelta
 import requests
 import numpy as np
 import pandas as pd
@@ -7,7 +8,9 @@ import streamlit as st
 from scipy.optimize import brentq
 from scipy.stats import poisson, nbinom
 
-st.set_page_config(page_title="RUSPRG Auto v4.2 Pro", layout="wide")
+st.set_page_config(page_title="RUSPRG Auto v4.3 Pro", layout="wide")
+
+TR_TZ = timezone(timedelta(hours=3))
 
 LEAGUES = {
     "Türkiye Süper Lig": "soccer_turkey_super_league",
@@ -24,8 +27,14 @@ LEAGUES = {
 
 
 # ==============================================================================
-# 1. İSTATİSTİKSEL MOTOR (P, Q, R, U, W, X, V ve CANLI v4.2)
+# 1. İSTATİSTİKSEL MOTOR (P, Q, R, U, W, X, V ve CANLI v4.3)
 # ==============================================================================
+def safe_fair_odd(prob):
+    if prob is None or prob <= 0.001:
+        return "-"
+    return round(1.0 / prob, 2)
+
+
 def devig_all(odds):
     inv = np.array([1.0 / o for o in odds], dtype=float)
     s = inv.sum()
@@ -104,8 +113,14 @@ def model_r_negbin(expected_total, phi=0.08):
     r = 1.0 / max(phi, 1e-6)
     p = r / (r + expected_total)
     probs = [nbinom.pmf(g, r, p) for g in range(7)]
+    o15 = 1.0 - sum(probs[:2])
     o25 = 1.0 - sum(probs[:3])
-    return {"O2.5": o25, "U2.5": 1.0 - o25}
+    o35 = 1.0 - sum(probs[:4])
+    return {
+        "O1.5": o15, "U1.5": 1.0 - o15,
+        "O2.5": o25, "U2.5": 1.0 - o25,
+        "O3.5": o35, "U3.5": 1.0 - o35,
+    }
 
 
 def model_u_elo_from_fair(p_h, p_a):
@@ -117,34 +132,25 @@ def model_u_elo_from_fair(p_h, p_a):
 
 def extract_markets(mat):
     h, d, a = np.tril(mat, -1).sum(), np.trace(mat), np.triu(mat, 1).sum()
+    o15 = sum(mat[i, j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i + j > 1.5)
     o25 = sum(mat[i, j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i + j > 2.5)
+    o35 = sum(mat[i, j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i + j > 3.5)
     btts = mat[1:, 1:].sum()
-    return {"1": h, "X": d, "2": a, "O2.5": o25, "U2.5": 1 - o25, "KG Var": btts, "KG Yok": 1 - btts}
-
-
-def live_v42(lam_h, lam_a, minute):
-    rem = max(0.0, 90.0 - float(minute))
-    frac = rem / 90.0
-    lh, la = lam_h * frac, lam_a * frac
-    tot = lh + la
-    goal_in = {f"{w} dk": round((1 - math.exp(-(lam_h + lam_a) * (min(w, rem) / 90.0))) * 100, 1) for w in (5, 10, 15)}
-    p_no = math.exp(-tot)
-    p_nh = (1 - p_no) * (lh / tot) if tot > 0 else 0.0
-    p_na = (1 - p_no) * (la / tot) if tot > 0 else 0.0
-    return goal_in, {"Ev": round(p_nh * 100, 1), "Dep": round(p_na * 100, 1), "Gol Olmaz": round(p_no * 100, 1)}
+    return {
+        "1": h, "X": d, "2": a,
+        "1X": h + d, "X2": a + d,
+        "O1.5": o15, "U1.5": 1 - o15,
+        "O2.5": o25, "U2.5": 1 - o25,
+        "O3.5": o35, "U3.5": 1 - o35,
+        "KG Var": btts, "KG Yok": 1 - btts,
+    }
 
 
 def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=0.08):
-    """
-    Çoklu büro verisinden:
-    1) Referans (Pinnacle varsa Pinnacle, yoksa medyan) oranlarla Model Q + X hesaplar.
-    2) Tüm bürolar arasında en iyi oranı bulup Model V (Edge, 1/4 Kelly, '!' bayat hat) üretir.
-    """
     books = match_obj["books"]
     if not (books["1"] and books["X"] and books["2"]):
         return None
 
-    # Referans oran: Pinnacle varsa onu, yoksa tüm büroların medyanını kullan
     def ref_price(mkt):
         if "Pinnacle" in books[mkt]:
             return books[mkt]["Pinnacle"]
@@ -164,20 +170,29 @@ def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=
     mr = model_r_negbin(lam_h + lam_a, phi)
     mu = model_u_elo_from_fair(fair_1x2[0], fair_1x2[2])
 
+    p1 = (mp["1"] * 1.0 + mw["1"] * 0.9 + fair_1x2[0] * 1.0 + mu["1"] * 0.9) / 3.8
+    px = (mp["X"] * 1.0 + mw["X"] * 0.9 + fair_1x2[1] * 1.0 + mu["X"] * 0.9) / 3.8
+    p2 = (mp["2"] * 1.0 + mw["2"] * 0.9 + fair_1x2[2] * 1.0 + mu["2"] * 0.9) / 3.8
+
     cons = {
-        "1": (mp["1"] * 1.0 + mw["1"] * 0.9 + fair_1x2[0] * 1.0 + mu["1"] * 0.9) / 3.8,
-        "X": (mp["X"] * 1.0 + mw["X"] * 0.9 + fair_1x2[1] * 1.0 + mu["X"] * 0.9) / 3.8,
-        "2": (mp["2"] * 1.0 + mw["2"] * 0.9 + fair_1x2[2] * 1.0 + mu["2"] * 0.9) / 3.8,
+        "1": p1,
+        "X": px,
+        "2": p2,
+        "1X": p1 + px,
+        "X2": p2 + px,
+        "O1.5": (mp["O1.5"] * 1.0 + mw["O1.5"] * 0.9 + mr["O1.5"] * 1.0) / 2.9,
         "O2.5": (mp["O2.5"] * 1.0 + mw["O2.5"] * 0.9 + mr["O2.5"] * 1.0) / 2.9,
         "U2.5": (mp["U2.5"] * 1.0 + mw["U2.5"] * 0.9 + mr["U2.5"] * 1.0) / 2.9,
+        "O3.5": (mp["O3.5"] * 1.0 + mw["O3.5"] * 0.9 + mr["O3.5"] * 1.0) / 2.9,
         "KG Var": (mp["KG Var"] * 1.0 + mw["KG Var"] * 0.9) / 1.9,
+        "KG Yok": (mp["KG Yok"] * 1.0 + mw["KG Yok"] * 0.9) / 1.9,
     }
 
     market_rows = []
     value_rows = []
 
     for mkt, prob in cons.items():
-        fair_odd = round(1.0 / prob, 2) if prob > 0 else 0.0
+        fair_odd = safe_fair_odd(prob)
         mkt_books = books.get(mkt, {})
         if mkt_books:
             best_book = max(mkt_books, key=mkt_books.get)
@@ -188,21 +203,28 @@ def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=
 
             is_value = (edge >= 0.02 and best_price >= 1.40 and prob >= 0.20)
             stake = round(0.25 * (edge / (best_price - 1.0)) * bankroll, 1) if is_value else 0.0
-            signal = "YEŞİL" if edge >= 0.05 else ("SARI" if is_value else "-")
+
+            if is_value and stale:
+                verdict = "⚠️ KONTROL (!)"
+            elif edge >= 0.05 and is_value:
+                verdict = "🟢 GÜÇLÜ DEĞER"
+            elif is_value:
+                verdict = "🟡 DEĞERLİ"
+            else:
+                verdict = "⛔ PAS"
 
             row = {
+                "Karar": verdict,
                 "Maç": f"{match_obj['home']} - {match_obj['away']}",
-                "Saat": match_obj["time"],
+                "Saat (TR)": match_obj["time"],
                 "Pazar": mkt,
                 "Olasılık (%)": round(prob * 100, 1),
                 "Adil Oran": fair_odd,
                 "En İyi Oran": best_price,
                 "Büro": best_book,
-                "Medyan": round(med_price, 2),
-                "Uyarı": stale,
                 "Edge (%)": round(edge * 100, 2),
                 "1/4 Kelly": stake if stake > 0 else 0.0,
-                "Sinyal": signal,
+                "Medyan": round(med_price, 2),
                 "Büro Sayısı": len(mkt_books),
             }
             market_rows.append(row)
@@ -210,18 +232,17 @@ def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=
                 value_rows.append(row)
         else:
             market_rows.append({
+                "Karar": "ℹ️ ADİL ORAN",
                 "Maç": f"{match_obj['home']} - {match_obj['away']}",
-                "Saat": match_obj["time"],
+                "Saat (TR)": match_obj["time"],
                 "Pazar": mkt,
                 "Olasılık (%)": round(prob * 100, 1),
                 "Adil Oran": fair_odd,
                 "En İyi Oran": None,
                 "Büro": "-",
-                "Medyan": None,
-                "Uyarı": "",
                 "Edge (%)": None,
                 "1/4 Kelly": 0.0,
-                "Sinyal": "-",
+                "Medyan": None,
                 "Büro Sayısı": 0,
             })
 
@@ -231,6 +252,94 @@ def analyze_multibook_match(match_obj, bankroll=1000.0, rho=-0.10, l3=0.12, phi=
         "margin": margin,
         "markets": market_rows,
         "values": value_rows,
+    }
+
+
+def live_full_auto(lam_h, lam_a, minute, home_goals, away_goals):
+    """
+    Canlı maç için tüm olasılıkları ve Adil Oranları (1 / Olasılık) otomatik üretir.
+    """
+    rem = max(0.0, 90.0 - float(minute))
+    frac = rem / 90.0
+    lh, la = lam_h * frac, lam_a * frac
+    tot_rem = lh + la
+    cur_total = int(home_goals) + int(away_goals)
+
+    # 5 / 10 / 15 dk gol olasılığı + Adil Oran
+    short_rows = []
+    p10_val = 0.0
+    for w in (5, 10, 15):
+        w_eff = min(w, rem)
+        p_w = 1.0 - math.exp(-(lam_h + lam_a) * (w_eff / 90.0)) if w_eff > 0 else 0.0
+        if w == 10:
+            p10_val = p_w
+        short_rows.append({
+            "Süre": f"Sonraki {w} dk Gol",
+            "Olasılık (%)": round(p_w * 100, 1),
+            "Adil Oran": safe_fair_odd(p_w),
+        })
+
+    # Sıradaki Gol (3 ihtimal toplam tam %100) + Adil Oran
+    p_no_more = math.exp(-tot_rem)
+    p_at_least_1 = 1.0 - p_no_more
+    p_at_least_2 = 1.0 - math.exp(-tot_rem) * (1.0 + tot_rem)
+    p_home_scores = 1.0 - math.exp(-lh)
+    p_away_scores = 1.0 - math.exp(-la)
+
+    if tot_rem > 0:
+        p_next_h = p_at_least_1 * (lh / tot_rem)
+        p_next_a = p_at_least_1 * (la / tot_rem)
+    else:
+        p_next_h = p_next_a = 0.0
+
+    next_rows = [
+        {"İhtimal": "Sıradaki Gol: Ev Sahibi", "Olasılık (%)": round(p_next_h * 100, 1), "Adil Oran": safe_fair_odd(p_next_h)},
+        {"İhtimal": "Sıradaki Gol: Deplasman", "Olasılık (%)": round(p_next_a * 100, 1), "Adil Oran": safe_fair_odd(p_next_a)},
+        {"İhtimal": "Daha Fazla Gol Olmaz", "Olasılık (%)": round(p_no_more * 100, 1), "Adil Oran": safe_fair_odd(p_no_more)},
+    ]
+
+    # Dinamik Canlı Pazarlar (Mevcut Skora Göre)
+    line_1 = cur_total + 0.5
+    line_2 = cur_total + 1.5
+    market_dict = {
+        f"Toplam {line_1} Üst (En az 1 gol daha)": p_at_least_1,
+        f"Toplam {line_1} Alt (Daha gol olmaz)": p_no_more,
+        f"Toplam {line_2} Üst (En az 2 gol daha)": p_at_least_2,
+        "Ev Sahibi 1 Gol Daha Atar": p_home_scores,
+        "Deplasman 1 Gol Daha Atar": p_away_scores,
+        "Sıradaki Gol: Ev Sahibi": p_next_h,
+        "Sıradaki Gol: Deplasman": p_next_a,
+    }
+
+    market_rows = [
+        {
+            "Canlı Pazar": name,
+            "Olasılık (%)": round(prob * 100, 1),
+            "Adil Oran (Büro bundan büyükse AL)": safe_fair_odd(prob),
+        }
+        for name, prob in market_dict.items()
+    ]
+
+    # Trafik Işığı Sinyali (Frankenstein v4.1 eşikleri)
+    if p10_val >= 0.45:
+        signal = "🟢 GOL YAKIN"
+    elif p10_val >= 0.35:
+        signal = "🟡 TEMPO YÜKSEK"
+    elif p_home_scores >= 0.55 or p_away_scores >= 0.55:
+        signal = "🟡 TAKIM GOLÜ OLABİLİR"
+    else:
+        signal = "⚪ NORMAL"
+
+    return {
+        "rem_min": int(rem),
+        "p10": round(p10_val * 100, 1),
+        "p_more1": round(p_at_least_1 * 100, 1),
+        "fair_more1": safe_fair_odd(p_at_least_1),
+        "signal": signal,
+        "short_df": pd.DataFrame(short_rows),
+        "next_df": pd.DataFrame(next_rows),
+        "markets_df": pd.DataFrame(market_rows),
+        "market_probs": market_dict,
     }
 
 
@@ -256,7 +365,15 @@ def fetch_odds_api(api_key, sport_key):
     for ev in events:
         home = ev.get("home_team", "Ev")
         away = ev.get("away_team", "Dep")
-        commence = ev.get("commence_time", "")[:16].replace("T", " ")
+        raw_time = ev.get("commence_time", "")
+        try:
+            dt_tr = datetime.fromisoformat(raw_time.replace("Z", "+00:00")).astimezone(TR_TZ)
+            commence_str = dt_tr.strftime("%d.%m %H:%M")
+            match_date = dt_tr.date()
+        except Exception:
+            commence_str = raw_time[:16].replace("T", " ")
+            match_date = None
+
         books = {"1": {}, "X": {}, "2": {}, "O2.5": {}, "U2.5": {}}
 
         for bm in ev.get("bookmakers", []):
@@ -285,11 +402,15 @@ def fetch_odds_api(api_key, sport_key):
                             elif nm == "Under":
                                 books["U2.5"][bm_name] = pr
 
-        parsed.append({"home": home, "away": away, "time": commence, "books": books})
+        parsed.append({
+            "home": home, "away": away,
+            "time": commence_str, "date": match_date,
+            "books": books,
+        })
     return parsed, remaining
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=45)
 def fetch_sstats_live():
     url = "https://api.sstats.net/Games/list?Live=true"
     resp = requests.get(url, timeout=10)
@@ -301,8 +422,9 @@ def fetch_sstats_live():
         home = (g.get("homeTeam") or {}).get("name") or g.get("homeName") or "Ev Sahibi"
         away = (g.get("awayTeam") or {}).get("name") or g.get("awayName") or "Deplasman"
         league = ((g.get("season") or {}).get("league") or {}).get("name") or g.get("leagueName") or "Lig"
-        score = f"{g.get('homeResult', 0)}-{g.get('awayResult', 0)}"
-        minute = g.get("elapsed") or g.get("minute") or 0
+        hg = int(g.get("homeResult") or 0)
+        ag = int(g.get("awayResult") or 0)
+        minute = int(g.get("elapsed") or g.get("minute") or 0)
 
         o1 = ox = o2 = oo = ou = None
         for mk in (g.get("odds") or []):
@@ -310,6 +432,8 @@ def fetch_sstats_live():
             for sel in mk.get("odds", []):
                 nm = str(sel.get("name", "")).lower()
                 val = sel.get("value")
+                if not val:
+                    continue
                 if "match winner" in m_name or "1x2" in m_name:
                     if nm in ("home", "1"): o1 = float(val)
                     elif nm in ("draw", "x"): ox = float(val)
@@ -319,9 +443,11 @@ def fetch_sstats_live():
                     elif nm == "under 2.5": ou = float(val)
 
         parsed.append({
-            "Etiket": f"[{league}] {home} - {away} ({score} | {minute}')",
-            "home": home, "away": away, "score": score, "minute": minute,
-            "o1": o1 or 2.15, "ox": ox or 3.30, "o2": o2 or 3.40, "oo": oo, "ou": ou,
+            "Etiket": f"[{league}] {home} - {away} ({hg}-{ag} | {minute}')",
+            "league": league, "home": home, "away": away,
+            "hg": hg, "ag": ag, "score": f"{hg}-{ag}", "minute": minute,
+            "o1": o1 or 2.15, "ox": ox or 3.30, "o2": o2 or 3.40,
+            "oo": oo, "ou": ou, "has_odds": o1 is not None,
         })
     return parsed
 
@@ -329,8 +455,10 @@ def fetch_sstats_live():
 # ==============================================================================
 # 3. ARAYÜZ
 # ==============================================================================
-st.title("RUSPRG Auto v4.2 Pro")
-st.caption("Çoklu Büro Value Tarayıcı (The Odds API) • Canlı Analiz (SStats) • P / Q / R / U / W / X / V")
+st.title("RUSPRG Auto v4.3 Pro")
+st.caption("Tam Otomatik Maç Önü Value Tarayıcı • Canlı Sinyal Tarayıcı • Adil Oran & Karar Motoru")
+
+today_tr = datetime.now(TR_TZ).date()
 
 with st.sidebar:
     st.header("Ayarlar")
@@ -338,9 +466,10 @@ with st.sidebar:
         "The Odds API Anahtarı",
         value=os.getenv("ODDS_API_KEY", ""),
         type="password",
-        help="the-odds-api.com üzerinden ücretsiz (aylık 500 istek) anahtar alabilirsiniz.",
+        help="the-odds-api.com ücretsiz API anahtarı",
     )
     selected_league = st.selectbox("Lig Seçin", list(LEAGUES.keys()))
+    date_filter = st.selectbox("Tarih Filtresi", ["Sadece Bugün", "Bugün + Yarın", "Tüm Yaklaşanlar"], index=0)
     min_edge = st.slider("Minimum Edge Filtresi (%)", 0.0, 10.0, 2.0, 0.5)
 
     with st.expander("Gelişmiş Sabit Katsayılar"):
@@ -350,27 +479,37 @@ with st.sidebar:
         phi = st.number_input("Neg. Binom φ", value=0.08, step=0.01)
 
 tab_scan, tab_detail, tab_live = st.tabs([
-    "Gün Tarayıcı (Çoklu Büro Value)",
-    "Maç Detayı & Büro Kıyaslama",
-    "Canlı Maçlar (SStats v4.2)",
+    "1. Gün Tarayıcı (Maç Önü)",
+    "2. Maç Detayı & Büro Kıyas",
+    "3. Canlı Tarayıcı & Adil Oran",
 ])
 
-# --- TAB 1 & 2: THE ODDS API ---
+# --- TAB 1 & 2: MAÇ ÖNÜ (THE ODDS API) ---
 matches_api = []
 if api_key:
     try:
-        matches_api, rem_quota = fetch_odds_api(api_key, LEAGUES[selected_league])
-        st.sidebar.success(f"Bağlandı • Kalan Aylık Hak: {rem_quota}")
+        all_fetched, rem_quota = fetch_odds_api(api_key, LEAGUES[selected_league])
+        st.sidebar.success(f"Bağlandı • Kalan Hak: {rem_quota}")
+        if date_filter == "Sadece Bugün":
+            matches_api = [m for m in all_fetched if m["date"] == today_tr]
+        elif date_filter == "Bugün + Yarın":
+            tomorrow_tr = today_tr + timedelta(days=1)
+            matches_api = [m for m in all_fetched if m["date"] in (today_tr, tomorrow_tr)]
+        else:
+            matches_api = all_fetched
     except Exception as e:
         st.sidebar.error(str(e))
 else:
-    st.sidebar.info("Çoklu büro taraması için The Odds API anahtarı girin.")
+    st.sidebar.info("Maç önü tarama için The Odds API anahtarı girin.")
 
 with tab_scan:
     if not api_key:
-        st.warning("Gün Tarayıcı için sol menüye ücretsiz The Odds API anahtarınızı girin.")
+        st.warning("Gün Tarayıcı için sol menüye The Odds API anahtarınızı girin.")
     elif not matches_api:
-        st.info("Bu ligde şu an açık maç bulunamadı.")
+        st.info(
+            f"{selected_league} için '{date_filter}' ({today_tr.strftime('%d.%m.%Y')}) "
+            "kapsamında açık maç önü oran bulunamadı. Sol menüden farklı lig veya 'Bugün + Yarın' seçebilirsiniz."
+        )
     else:
         all_values = []
         for m in matches_api:
@@ -386,11 +525,11 @@ with tab_scan:
             df_val = pd.DataFrame(all_values).sort_values("Edge (%)", ascending=False)
             st.success(f"{len(matches_api)} maç tarandı • {len(df_val)} değer bahsi (Value) bulundu.")
             st.dataframe(df_val, use_container_width=True, hide_index=True)
-            st.caption("Uyarı sütunundaki '!' işareti, en iyi oranın piyasa medyanından en az %8 yukarıda olduğunu (bayat oran veya limit riski) gösterir.")
+            st.caption("🟢 GÜÇLÜ DEĞER: Edge ≥ %5 | 🟡 DEĞERLİ: Edge %2–%5 | ⚠️ KONTROL (!): Büro oranı medyanın %8+ üstünde (sakatlık/bayat hat kontrolü yapın).")
 
 with tab_detail:
     if not matches_api:
-        st.info("Önce sol menüden API anahtarı girip bir lig yükleyin.")
+        st.info("Seçili tarih ve ligde maç bulunamadı. Sol menüden ligi veya tarih filtresini değiştirin.")
     else:
         labels = [f"{m['time']} | {m['home']} - {m['away']}" for m in matches_api]
         idx = st.selectbox("Maç Seçin", range(len(labels)), format_func=lambda i: labels[i])
@@ -401,12 +540,12 @@ with tab_detail:
             c1, c2, c3 = st.columns(3)
             c1.metric("Otomatik Ev xG (λ_h)", f"{res['lam_h']:.2f}")
             c2.metric("Otomatik Dep xG (λ_a)", f"{res['lam_a']:.2f}")
-            c3.metric("Referans Piyasa Marjı", f"%{res['margin']*100:.1f}")
+            c3.metric("Piyasa Marjı", f"%{res['margin']*100:.1f}")
 
-            st.subheader("Model X Konsensüs & En İyi Büro (Model V)")
+            st.subheader("Tüm Pazarlar: Olasılık, Adil Oran ve Otomatik Karar")
             st.dataframe(pd.DataFrame(res["markets"]), use_container_width=True, hide_index=True)
 
-            st.subheader("Tüm Büroların 1X2 Oranları")
+            st.subheader("Tüm Büroların Oran Karşılaştırması")
             book_names = sorted(set(m["books"]["1"]) | set(m["books"]["X"]) | set(m["books"]["2"]))
             bm_table = [{
                 "Büro": b,
@@ -418,32 +557,83 @@ with tab_detail:
             } for b in book_names]
             st.dataframe(pd.DataFrame(bm_table), use_container_width=True, hide_index=True)
 
-# --- TAB 3: CANLI (SSTATS) ---
+# --- TAB 3: CANLI TARAYICI & ADİL ORAN HESAPLAYICI ---
 with tab_live:
+    col_f1, col_f2 = st.columns([3, 1])
+    hide_bad_min = col_f1.checkbox("Hatalı/Bitmiş dakikaları (0' ve 86'+) otomatik gizle", value=True)
+    if col_f2.button("Canlıyı Yenile"):
+        fetch_sstats_live.clear()
+
     try:
-        live_matches = fetch_sstats_live()
+        raw_live = fetch_sstats_live()
     except Exception as e:
-        live_matches = []
+        raw_live = []
         st.warning(f"SStats canlı verisi alınamadı: {e}")
 
+    live_matches = [m for m in raw_live if (1 <= m["minute"] <= 85)] if hide_bad_min else raw_live
+
     if not live_matches:
-        st.info("Şu an canlı maç listesi boş.")
+        st.info("Filtreye uyan (1'–85' arası) aktif canlı maç şu an bulunamadı.")
     else:
-        sel = st.selectbox("Canlı Maç Seçin", [x["Etiket"] for x in live_matches])
-        lm = next(x for x in live_matches if x["Etiket"] == sel)
+        # 1) Tüm Canlı Maçları Otomatik Tara ve Sinyale Göre Sırala
+        scan_rows = []
+        live_cache = {}
+        for lm in live_matches:
+            fair_1x2, _ = devig_all([lm["o1"], lm["ox"], lm["o2"]])
+            p_o25 = devig_all([lm["oo"], lm["ou"]])[0][0] if (lm["oo"] and lm["ou"]) else None
+            lh, la = invert_odds_to_xg(fair_1x2[0], fair_1x2[2], p_o25)
+            lres = live_full_auto(lh, la, lm["minute"], lm["hg"], lm["ag"])
+            live_cache[lm["Etiket"]] = (lm, lh, la, lres)
+            scan_rows.append({
+                "Sinyal": lres["signal"],
+                "Maç": f"{lm['home']} - {lm['away']}",
+                "Lig": lm["league"],
+                "Skor": lm["score"],
+                "Dk": f"{lm['minute']}'",
+                "10 dk Gol (%)": lres["p10"],
+                "+1 Gol (%)": lres["p_more1"],
+                "+1 Gol Adil Oran": lres["fair_more1"],
+            })
 
-        fair_1x2, _ = devig_all([lm["o1"], lm["ox"], lm["o2"]])
-        p_o25 = devig_all([lm["oo"], lm["ou"]])[0][0] if (lm["oo"] and lm["ou"]) else None
-        lh, la = invert_odds_to_xg(fair_1x2[0], fair_1x2[2], p_o25)
+        st.subheader("Otomatik Canlı Fırsat Tarayıcısı")
+        df_live_scan = pd.DataFrame(scan_rows).sort_values("10 dk Gol (%)", ascending=False)
+        st.dataframe(df_live_scan, use_container_width=True, hide_index=True)
 
-        k1, k2, k3 = st.columns(3)
+        # 2) Seçili Canlı Maçın Detaylı Adil Oran Tabloları
+        st.divider()
+        sel = st.selectbox("Detaylı Canlı Analiz ve Büro Oranı Testi İçin Maç Seçin", [x["Etiket"] for x in live_matches])
+        lm, lh, la, lres = live_cache[sel]
+
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Skor / Dakika", f"{lm['score']} ({lm['minute']}')")
-        k2.metric("Maç Öncesi Ev xG", f"{lh:.2f}")
-        k3.metric("Maç Öncesi Dep xG", f"{la:.2f}")
+        k2.metric("Sinyal", lres["signal"])
+        k3.metric("Maç Öncesi Ev xG", f"{lh:.2f}")
+        k4.metric("Maç Öncesi Dep xG", f"{la:.2f}")
 
-        g_in, nxt = live_v42(lh, la, lm["minute"])
+        st.subheader("Tüm Canlı Pazarlar ve Otomatik Adil Oranlar")
+        st.dataframe(lres["markets_df"], use_container_width=True, hide_index=True)
+
         col_a, col_b = st.columns(2)
-        col_a.markdown("**Kısa Vadede Gol Olasılığı (%)**")
-        col_a.table(pd.DataFrame(g_in.items(), columns=["Süre", "Olasılık (%)"]))
-        col_b.markdown("**Sıradaki Gol Dağılımı (% — Toplam 100)**")
-        col_b.table(pd.DataFrame(nxt.items(), columns=["İhtimal", "Olasılık (%)"]))
+        col_a.markdown("**Kısa Vadede Gol Olasılığı ve Adil Oran**")
+        col_a.dataframe(lres["short_df"], use_container_width=True, hide_index=True)
+        col_b.markdown("**Sıradaki Gol (Toplam %100) ve Adil Oran**")
+        col_b.dataframe(lres["next_df"], use_container_width=True, hide_index=True)
+
+        # 3) Otomatik Canlı Bahis Karar Hesaplayıcı (Adil Oran Kuralı)
+        st.divider()
+        st.subheader("Canlı Bahis Karar Hesaplayıcı (Büro Oranını Test Et)")
+        bc1, bc2 = st.columns([2, 1])
+        chosen_mkt = bc1.selectbox("Oynamak İstediğiniz Canlı Pazar", list(lres["market_probs"].keys()))
+        book_odd = bc2.number_input("Sitenizdeki Canlı Oran", min_value=1.01, max_value=50.0, value=1.85, step=0.05)
+
+        prob_m = lres["market_probs"][chosen_mkt]
+        fair_m = safe_fair_odd(prob_m)
+        edge_m = prob_m * book_odd - 1.0
+        kelly_m = round(0.25 * (edge_m / (book_odd - 1.0)) * bankroll, 1) if (edge_m > 0 and book_odd > 1.0) else 0.0
+
+        if edge_m >= 0.05 and book_odd >= 1.40:
+            st.success(f"✅ GÜÇLÜ DEĞER (ALINIR) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: +%{edge_m*100:.1f} | 1/4 Kelly: {kelly_m} birim")
+        elif edge_m >= 0.02 and book_odd >= 1.40:
+            st.info(f"🟡 DEĞERLİ (ALINABİLİR) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: +%{edge_m*100:.1f} | 1/4 Kelly: {kelly_m} birim")
+        else:
+            st.error(f"❌ PAS GEÇ (ORAN DÜŞÜK) — Olasılık: %{prob_m*100:.1f} | Adil Oran: {fair_m} | Büro: {book_odd:.2f} | Edge: %{edge_m*100:.1f}")
